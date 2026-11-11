@@ -11,14 +11,19 @@ const PORT = process.env.PORT || 5000;
 const authBaseUrl = (
   process.env.BETTER_AUTH_URL ||
   process.env.CLIENT_URL ||
+  process.env.FRONTEND_URL ||
   "http://localhost:3000"
 ).replace(/\/+$/, "");
 const allowedOrigins = new Set(
   [
     process.env.CLIENT_URL,
+    process.env.FRONTEND_URL,
     process.env.BETTER_AUTH_URL,
+    process.env.NEXT_PUBLIC_APP_URL,
     "http://localhost:3000",
     "http://127.0.0.1:3000",
+    "http://localhost:5000",
+    "http://127.0.0.1:5000",
   ]
     .filter(Boolean)
     .map((origin) => origin.replace(/\/+$/, "")),
@@ -35,13 +40,16 @@ app.use(
       return callback(new Error("Origin not allowed by CORS"));
     },
     credentials: true,
+    methods: ["GET", "POST", "PATCH", "PUT", "DELETE", "OPTIONS"],
+    allowedHeaders: ["Content-Type", "Authorization", "Cookie", "Accept"],
   }),
 );
 app.use(express.json());
 
 const requireRole = (requiredRole) => async (req, res, next) => {
   const cookie = req.get("cookie");
-  if (!cookie) {
+  const authHeader = req.get("authorization");
+  if (!cookie && !authHeader) {
     return res.status(401).json({
       success: false,
       message: "Authentication is required",
@@ -49,11 +57,14 @@ const requireRole = (requiredRole) => async (req, res, next) => {
   }
 
   try {
+    const sessionHeaders = {
+      accept: "application/json",
+    };
+    if (cookie) sessionHeaders.cookie = cookie;
+    if (authHeader) sessionHeaders.authorization = authHeader;
+
     const sessionResponse = await fetch(`${authBaseUrl}/api/auth/get-session`, {
-      headers: {
-        cookie,
-        accept: "application/json",
-      },
+      headers: sessionHeaders,
       cache: "no-store",
     });
 
@@ -97,13 +108,16 @@ const requireRole = (requiredRole) => async (req, res, next) => {
 // MongoDB Connection
 const uri = process.env.MONGODB_URI;
 
-const client = new MongoClient(uri, {
-  serverApi: {
-    version: ServerApiVersion.v1,
-    strict: true,
-    deprecationErrors: true,
-  },
-});
+let client;
+if (uri) {
+  client = new MongoClient(uri, {
+    serverApi: {
+      version: ServerApiVersion.v1,
+      strict: true,
+      deprecationErrors: true,
+    },
+  });
+}
 
 // Database and Collections
 let db;
@@ -116,32 +130,113 @@ let contestCollection;
 let resourceCollection;
 let webHackathonCollection;
 let webResourceCollection;
-// Routes
+
+let connectPromise = null;
+let indexesEnsured = false;
+
+async function ensureIndexes() {
+  if (indexesEnsured || !membershipCollection || !joinRequestCollection) return;
+  try {
+    await membershipCollection.createIndex(
+      { userId: 1, clubId: 1 },
+      { unique: true }
+    );
+    await joinRequestCollection.createIndex(
+      { userId: 1, clubId: 1 },
+      { unique: true, partialFilterExpression: { status: "pending" } }
+    );
+    indexesEnsured = true;
+  } catch (error) {
+    console.warn("Index initialization warning:", error.message);
+  }
+}
+
+async function connectDB() {
+  if (db) return db;
+  if (!client) {
+    throw new Error("MONGODB_URI is not configured in environment variables.");
+  }
+
+  if (!connectPromise) {
+    connectPromise = (async () => {
+      await client.connect();
+      const databaseName = process.env.DB_NAME || "CodingHub";
+      db = client.db(databaseName);
+
+      // Collections
+      userCollection = db.collection("user");
+      clubCollection = db.collection("clubs");
+      eventCollection = db.collection("events");
+      membershipCollection = db.collection("memberships");
+      joinRequestCollection = db.collection("joinRequests");
+      contestCollection = db.collection("contests");
+      resourceCollection = db.collection("resources");
+
+      // Web Development Club Collections
+      webHackathonCollection = db.collection("webHackathons");
+      webResourceCollection = db.collection("webResources");
+
+      await ensureIndexes();
+      console.log("MongoDB Connected Successfully!");
+      return db;
+    })().catch((err) => {
+      connectPromise = null;
+      throw err;
+    });
+  }
+
+  return connectPromise;
+}
+
+// Root route
 app.get("/", (req, res) => {
   res.send("Coding Hub Server is Running!");
 });
 
-async function run() {
+// Production Health Check Route
+app.get("/api/health", async (req, res) => {
+  let dbStatus = "disconnected";
   try {
-    await client.connect();
+    if (db) {
+      await db.command({ ping: 1 });
+      dbStatus = "connected";
+    } else if (client) {
+      await connectDB();
+      dbStatus = "connected";
+    }
+  } catch (error) {
+    dbStatus = "error";
+  }
 
-    db = client.db("CodingHub");
+  res.status(200).json({
+    status: "ok",
+    timestamp: new Date().toISOString(),
+    service: "CodingHub API",
+    database: dbStatus,
+  });
+});
 
-    // Collections
-    userCollection = db.collection("user");
-    clubCollection = db.collection("clubs");
-    eventCollection = db.collection("events");
-    membershipCollection = db.collection("memberships");
-    joinRequestCollection = db.collection("joinRequests");
-    contestCollection = db.collection("contests");
-    resourceCollection = db.collection("resources");
+// Middleware to ensure database connectivity for all API endpoints
+app.use(async (req, res, next) => {
+  if (req.path === "/" || req.path === "/api/health") {
+    return next();
+  }
 
-    // Web Development Club Collections
-    webHackathonCollection = db.collection("webHackathons");
-    webResourceCollection = db.collection("webResources");
-    // ===================================
-    // CLUB MANAGEMENT ROUTES
-    // ===================================
+  try {
+    await connectDB();
+    next();
+  } catch (error) {
+    console.error("MongoDB Connection Middleware Error:", error);
+    res.status(503).json({
+      success: false,
+      message: "Database connection unavailable. Please try again later.",
+    });
+  }
+});
+
+// ===================================
+// CLUB MANAGEMENT ROUTES
+// ===================================
 
     // 1. Get All Clubs
     app.get("/api/clubs", async (req, res) => {
@@ -714,8 +809,9 @@ async function run() {
 
     const authenticateUser = async (req, res, next) => {
       const cookie = req.get("cookie");
+      const authHeader = req.get("authorization");
 
-      if (!cookie) {
+      if (!cookie && !authHeader) {
         return res.status(401).json({
           success: false,
           message: "Authentication is required.",
@@ -723,13 +819,16 @@ async function run() {
       }
 
       try {
+        const sessionHeaders = {
+          accept: "application/json",
+        };
+        if (cookie) sessionHeaders.cookie = cookie;
+        if (authHeader) sessionHeaders.authorization = authHeader;
+
         const sessionResponse = await fetch(
           `${authBaseUrl}/api/auth/get-session`,
           {
-            headers: {
-              cookie,
-              accept: "application/json",
-            },
+            headers: sessionHeaders,
             cache: "no-store",
           },
         );
@@ -2790,34 +2889,7 @@ const requireClubPresident = async (req, res, next) => {
 };
 
 
-// ===================================
-// DATABASE INDEXES
-// ===================================
-
-// Prevent duplicate active memberships
-await membershipCollection.createIndex(
-  {
-    userId: 1,
-    clubId: 1,
-  },
-  {
-    unique: true,
-  }
-);
-
-// Prevent duplicate pending join requests
-await joinRequestCollection.createIndex(
-  {
-    userId: 1,
-    clubId: 1,
-  },
-  {
-    unique: true,
-    partialFilterExpression: {
-      status: "pending",
-    },
-  }
-);
+// Database indexes are initialized inside ensureIndexes() on database connection.
 
 
 // ===================================
@@ -3383,16 +3455,38 @@ app.delete(
   }
 );
 
-    await db.command({ ping: 1 });
+// Global error handling middleware
+app.use((err, req, res, next) => {
+  console.error("Unhandled API error:", err);
 
-    console.log("MongoDB Connected Successfully!");
-  } catch (error) {
-    console.error("MongoDB Connection Error:", error);
+  if (res.headersSent) {
+    return next(err);
   }
-}
 
-run();
-
-app.listen(PORT, () => {
-  console.log(`Server running on port ${PORT}`);
+  res.status(err.status || 500).json({
+    success: false,
+    message:
+      process.env.NODE_ENV === "production"
+        ? "An internal server error occurred."
+        : err.message || "Internal server error.",
+  });
 });
+
+module.exports = app;
+
+if (require.main === module && !process.env.VERCEL) {
+  connectDB()
+    .then(() => {
+      app.listen(PORT, () => {
+        console.log(`Server running on port ${PORT}`);
+      });
+    })
+    .catch((error) => {
+      console.error("Failed to connect to MongoDB on startup:", error);
+      app.listen(PORT, () => {
+        console.log(
+          `Server running on port ${PORT} (database connection will retry on request)`
+        );
+      });
+    });
+}
